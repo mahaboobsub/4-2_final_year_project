@@ -135,7 +135,6 @@ logger.info(f"CONFIG: LLM provider = {'Cloud Mistral API' if use_cloud else 'Loc
 st.sidebar.divider()
 
 
-
 # ─── HELPER: GET LLM ────────────────────────────────────────────────────────
 def get_llm(use_cloud_api):
     """Returns the appropriate LLM based on the selected provider."""
@@ -148,10 +147,13 @@ def get_llm(use_cloud_api):
         )
     else:
         logger.info("  LLM: Initializing Local Ollama (model=mistral:7b-instruct-q2_K)")
-        return OllamaLLM(
-            model="mistral:7b-instruct-q2_K",
-            streaming=True
-        )
+        return OllamaLLM(model="mistral:7b-instruct-q2_K")
+
+# ─── HELPER: FILE HASHING ───────────────────────────────────────────────────
+def get_file_hash(files):
+    """Generate a hash based on the names & sizes of all uploaded files."""
+    hash_str = "".join([f"{f.name}-{f.size}" for f in files])
+    return hashlib.md5(hash_str.encode()).hexdigest()
 
 # ─── FAISS INDEX PATH ────────────────────────────────────────────────────────
 FAISS_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "faiss_index")
@@ -160,27 +162,19 @@ logger.info(f"CONFIG: FAISS index path = {FAISS_INDEX_PATH}")
 # ─── DETECT PROVIDER CHANGE ─────────────────────────────────────────────────
 provider_key = "cloud" if use_cloud else "local"
 if st.session_state.current_provider and st.session_state.current_provider != provider_key:
-    # Provider changed — rebuild chain if PDF was already processed
     if st.session_state.chain is not None:
         st.session_state.chain = None
         logger.info(f"PROVIDER CHANGE: {st.session_state.current_provider} → {provider_key}, rebuilding chain")
 
-# ─── HELPER: FILE HASHING ───────────────────────────────────────────────────
-def get_file_hash(files):
-    """Generate a hash based on the names & sizes of all uploaded files."""
-    hash_str = "".join([f"{f.name}-{f.size}" for f in files])
-    return hashlib.md5(hash_str.encode()).hexdigest()
-
-# ─── PDF PROCESSING PIPELINE ────────────────────────────────────────────────
+# ─── FILE HASH CHECK (prevents unnecessary FAISS rebuilds) ──────────────────
 if uploaded_files:
     current_hash = get_file_hash(uploaded_files)
-    
-    # Check if files changed
     if "file_hash" not in st.session_state or st.session_state.file_hash != current_hash:
         st.session_state.chain = None
         st.session_state.file_hash = current_hash
         logger.info(f"FILE CHANGE DETECTED: New hash {current_hash}. Resetting chain.")
 
+# ─── PDF PROCESSING PIPELINE ────────────────────────────────────────────────
 if uploaded_files and st.session_state.chain is None:
 
     logger.info("=" * 60)
@@ -189,85 +183,69 @@ if uploaded_files and st.session_state.chain is None:
     pipeline_start = time.time()
 
     with st.spinner("🔄 Processing your PDF(s)... Please wait."):
-        
+
+        # Step 1: Load PDFs
         status_text = st.empty()
-        
-        # Check if we can just load the existing index
-        index_exists = os.path.exists(FAISS_INDEX_PATH) and os.listdir(FAISS_INDEX_PATH)
-        
-        # We need embeddings early to either load or create FAISS
-        status_text.info(f"🧠 Preparing embeddings model...")
-        embeddings_start = time.time()
+        status_text.info("📄 Step 1/5: Loading PDF documents...")
+        step_start = time.time()
+        documents = []
+
+        for uploaded_file in uploaded_files:
+            logger.info(f"  LOAD: Reading file '{uploaded_file.name}' ({uploaded_file.size} bytes)")
+
+            try:
+                with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_path = tmp_file.name
+
+                loader = PyPDFLoader(tmp_path)
+                loaded_docs = loader.load()
+                documents.extend(loaded_docs)
+                logger.info(f"  LOAD: Extracted {len(loaded_docs)} pages from '{uploaded_file.name}'")
+
+                os.remove(tmp_path)
+            except Exception as e:
+                logger.error(f"  LOAD ERROR: Failed to load '{uploaded_file.name}': {e}")
+                st.error(f"❌ Failed to load '{uploaded_file.name}': {e}")
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        logger.info(f"  LOAD: Total pages loaded = {len(documents)} | Time: {time.time() - step_start:.2f}s")
+
+        # Step 2: Split text into chunks
+        status_text.info(f"✂️ Step 2/5: Splitting {len(documents)} pages into chunks...")
+        step_start = time.time()
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
+        )
+        docs = text_splitter.split_documents(documents)
+        logger.info(f"  SPLIT: Created {len(docs)} chunks (chunk_size=1000, overlap=100) | Time: {time.time() - step_start:.2f}s")
+
+        # Step 3: Generate embeddings
+        status_text.info(f"🧠 Step 3/5: Generating embeddings for {len(docs)} chunks...")
+        step_start = time.time()
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-        logger.info(f"  EMBED: HuggingFace model loaded | Time: {time.time() - embeddings_start:.2f}s")
+        logger.info(f"  EMBED: HuggingFace model loaded (all-MiniLM-L6-v2) | Time: {time.time() - step_start:.2f}s")
 
-        if index_exists:
-            status_text.info("💾 Loading existing FAISS database from disk...")
-            step_start = time.time()
-            vector_store = FAISS.load_local(
-                FAISS_INDEX_PATH,
-                embeddings,
-                allow_dangerous_deserialization=True
-            )
-            logger.info(f"  FAISS: Loaded existing vectors from disk | Time: {time.time() - step_start:.2f}s")
-        else:
-            # Full processing pipeline needed
-            status_text.info("📄 Step 1/5: Loading PDF documents...")
-            step_start = time.time()
-            documents = []
-    
-            for uploaded_file in uploaded_files:
-                logger.info(f"  LOAD: Reading file '{uploaded_file.name}' ({uploaded_file.size} bytes)")
-    
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-    
-                    loader = PyPDFLoader(tmp_path)
-                    loaded_docs = loader.load()
-                    documents.extend(loaded_docs)
-                    logger.info(f"  LOAD: Extracted {len(loaded_docs)} pages from '{uploaded_file.name}'")
-    
-                    os.remove(tmp_path)
-                except Exception as e:
-                    logger.error(f"  LOAD ERROR: Failed to load '{uploaded_file.name}': {e}")
-                    st.error(f"❌ Failed to load '{uploaded_file.name}': {e}")
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-    
-            logger.info(f"  LOAD: Total pages loaded = {len(documents)} | Time: {time.time() - step_start:.2f}s")
-    
-            # Step 2: Split text into chunks
-            status_text.info(f"✂️ Step 2/5: Splitting {len(documents)} pages into chunks...")
-            step_start = time.time()
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=100
-            )
-            docs = text_splitter.split_documents(documents)
-            logger.info(f"  SPLIT: Created {len(docs)} chunks (chunk_size=1000, overlap=100) | Time: {time.time() - step_start:.2f}s")
-    
-            # Step 4: Create and save FAISS vector store
-            status_text.info("💾 Step 4/5: Creating FAISS database...")
-            step_start = time.time()
-            
-            vector_store = FAISS.from_documents(docs, embeddings)
-            vector_store.save_local(FAISS_INDEX_PATH)
-            
-            index_size = sum(os.path.getsize(os.path.join(FAISS_INDEX_PATH, f)) for f in os.listdir(FAISS_INDEX_PATH))
-            logger.info(f"  FAISS: Vector store created & saved ({index_size} bytes on disk) | Time: {time.time() - step_start:.2f}s")
+        # Step 4: Create and save FAISS vector store
+        status_text.info("💾 Step 4/5: Storing vectors in FAISS database...")
+        step_start = time.time()
+        vector_store = FAISS.from_documents(docs, embeddings)
+        vector_store.save_local(FAISS_INDEX_PATH)
+        index_size = sum(os.path.getsize(os.path.join(FAISS_INDEX_PATH, f)) for f in os.listdir(FAISS_INDEX_PATH))
+        logger.info(f"  FAISS: Vector store created & saved ({index_size} bytes on disk) | Time: {time.time() - step_start:.2f}s")
 
         # Step 5: Build the conversational chain
-        status_text.info("🔗 Connecting to Mistral model...")
+        status_text.info("🔗 Step 5/5: Connecting to Mistral model...")
         step_start = time.time()
         llm = get_llm(use_cloud)
 
         # Dynamic memory size for RAG memory buffer
         auto_k = 5 if use_cloud else 2
-        
+
         memory = ConversationBufferWindowMemory(
             k=auto_k,
             memory_key="chat_history",
@@ -277,9 +255,8 @@ if uploaded_files and st.session_state.chain is None:
 
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
-            retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
-            memory=memory,
-            return_source_documents=True
+            retriever=vector_store.as_retriever(search_kwargs={"k": 2}),
+            memory=memory
         )
         logger.info(f"  CHAIN: Built successfully | Time: {time.time() - step_start:.2f}s")
 
@@ -340,56 +317,62 @@ if prompt := st.chat_input(input_placeholder):
     with st.chat_message("user"):
         st.write(prompt)
 
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        full_response = ""
-        sources = []
+    # ─── RAG MODE: Use the PDF retrieval chain ───────────────────────────
+    if is_rag_mode:
+        if st.session_state.chain:
+            logger.info("LLM: Sending query via RAG chain...")
+            query_start = time.time()
 
-        try:
-            # ─── RAG MODE: Use the PDF retrieval chain with SINGLE CALL ─────
-            if is_rag_mode:
-                if st.session_state.chain:
-                    logger.info("LLM: Sending query via RAG chain...")
-                    
-                    # 1. Invoke ONCE to get answer AND source documents
-                    response = st.session_state.chain.invoke({"question": prompt})
-                    sources = response.get("source_documents", [])
-                    answer_text = response["answer"]
-                    
-                    # 2. Fake stream to UI character by character for smooth UX without double API call
-                    for char in answer_text:
-                        full_response += char
-                        placeholder.markdown(full_response + "▌")
-                        time.sleep(0.002)
-                    placeholder.markdown(full_response)  # remove cursor
-                else:
-                    full_response = "⚠️ Please upload a PDF first to use RAG mode!"
-                    placeholder.markdown(full_response)
-                    logger.warning("NO CHAIN: RAG mode but no PDF uploaded")
+            with st.spinner("🔍 Searching PDF & generating answer..."):
+                try:
+                    # ✅ MUST pass chat_history explicitly for langchain_classic
+                    response = st.session_state.chain.invoke({
+                        "question": prompt + " (Answer in English only)",
+                        "chat_history": []
+                    })
+                    answer = response["answer"]
 
-            # ─── DIRECT CHAT MODE: Talk to the LLM directly with STREAMING ───
-            else:
-                logger.info("LLM: Sending query directly (no RAG)...")
+                    query_time = time.time() - query_start
+                    logger.info(f"LLM: Response received | Time: {query_time:.2f}s")
+                    logger.info(f"LLM: Answer preview: '{answer[:100]}...'")
+                except Exception as e:
+                    logger.error(f"LLM ERROR: API call failed -> {str(e)}")
+                    answer = f"⚠️ **API Error:** {str(e)}. Please wait a few seconds and try again, or switch to **Local Ollama**."
+        else:
+            answer = "⚠️ Please upload a PDF first to use RAG mode!"
+            logger.warning("NO CHAIN: RAG mode but no PDF uploaded")
+
+    # ─── DIRECT CHAT MODE: Talk to the LLM directly ─────────────────────
+    else:
+        logger.info("LLM: Sending query directly (no RAG)...")
+        query_start = time.time()
+
+        with st.spinner("💬 Generating response..."):
+            try:
                 llm = get_llm(use_cloud)
                 auto_k = 5 if use_cloud else 2
-                
+
+                # Get the last `k` pairs of history (excluding the prompt we just appended)
                 past_messages = st.session_state.messages[:-1]
                 recent_history = past_messages[-(auto_k * 2):] if len(past_messages) > 0 else []
-                
+
                 if use_cloud and has_api_key:
+                    # Cloud Mistral uses LangChain Messages
                     chat_history = []
                     for msg in recent_history:
                         if msg["role"] == "user":
                             chat_history.append(HumanMessage(content=msg["content"]))
                         elif msg["role"] == "assistant":
                             chat_history.append(AIMessage(content=msg["content"]))
+
+                    # Add current prompt
                     chat_history.append(HumanMessage(content=prompt))
-                    
-                    for chunk in llm.stream(chat_history):
-                        full_response += chunk.content
-                        placeholder.markdown(full_response + "▌")
-                    placeholder.markdown(full_response)
+
+                    logger.info(f"LLM: Attached {len(chat_history)-1} previous messages as context (k={auto_k})")
+                    result = llm.invoke(chat_history)
+                    answer = result.content
                 else:
+                    # Local Ollama uses a formatted string prompt
                     history_str = ""
                     if recent_history:
                         history_str = "Conversation History:\n"
@@ -397,43 +380,23 @@ if prompt := st.chat_input(input_placeholder):
                             role = "User" if msg["role"] == "user" else "AI"
                             history_str += f"{role}: {msg['content']}\n"
                         history_str += "\nCurrent Question:\n"
+
                     full_prompt = history_str + prompt
-                    
-                    for chunk in llm.stream(full_prompt):
-                        full_response += chunk
-                        placeholder.markdown(full_response + "▌")
-                    placeholder.markdown(full_response)
+                    logger.info(f"LLM: Attached {len(recent_history)} previous messages as context (k={auto_k})")
+                    answer = llm.invoke(full_prompt)
 
-            # ─── SOURCE HIGHLIGHTING UI ──────────────────────────────────────
-            if sources:
-                with st.expander("📄 Sources Used"):
-                    for i, doc in enumerate(sources):
-                        page = doc.metadata.get("page", "N/A")
-                        source = doc.metadata.get("source", "Unknown file")
+                query_time = time.time() - query_start
+                logger.info(f"LLM: Direct response received | Time: {query_time:.2f}s")
+                logger.info(f"LLM: Answer preview: '{str(answer)[:100]}...'")
+            except Exception as e:
+                logger.error(f"LLM ERROR: API call failed -> {str(e)}")
+                answer = f"⚠️ **API Error:** {str(e)}. Please wait a few seconds and try again, or switch to **Local Ollama**."
 
-                        st.markdown(f"**📌 Source {i+1}**")
-                        # Better UX for page number
-                        page_display = page + 1 if isinstance(page, int) else page
-                        st.markdown(f"📄 **{os.path.basename(source)}** — Page **{page_display}**")
-                        
-                        # Highlight matched text based on prompt
-                        highlight_text = doc.page_content[:200]
-                        prompt_snippet = prompt[:10].strip()
-                        if prompt_snippet and len(prompt_snippet) > 3:
-                            # Use case-insensitive replace by importing re, but for now just exact match
-                            highlight_text = highlight_text.replace(prompt_snippet, f"**{prompt_snippet}**")
-                        
-                        st.write(highlight_text + "...")
-                        if i < len(sources) - 1:
-                            st.divider()
-
-        except Exception as e:
-            logger.error(f"LLM ERROR: {str(e)}")
-            full_response = "⚠️ **API Connection Error:** The AI service is currently busy or rate-limited. Please wait a few seconds and try again, or switch to **Local Ollama**."
-            placeholder.markdown(full_response)
+    with st.chat_message("assistant"):
+        st.write(answer)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": full_response}
+        {"role": "assistant", "content": answer}
     )
     # Save the updated messages to local storage
     local_storage.setItem("chat_history", st.session_state.messages)

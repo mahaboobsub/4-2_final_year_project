@@ -1,8 +1,6 @@
 import streamlit as st
 import time
 
-st.set_page_config(page_title="Chat History", layout="wide")
-
 st.title("📜 Chat History")
 st.caption("All Q&A pairs from the current session")
 
