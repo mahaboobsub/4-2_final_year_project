@@ -1,8 +1,17 @@
 import streamlit as st
 import time
+from streamlit_local_storage import LocalStorage
+
+local_storage = LocalStorage()
 
 st.title("📜 Chat History")
 st.caption("All Q&A pairs from the current session")
+
+# ─── LOAD MESSAGES FROM LOCAL STORAGE IF NEEDED ──────────────────────────────
+if "messages" not in st.session_state or len(st.session_state.messages) == 0:
+    saved = local_storage.getItem("chat_history")
+    if saved and isinstance(saved, list) and len(saved) > 0:
+        st.session_state.messages = saved
 
 # ─── CHECK SESSION STATE ─────────────────────────────────────────────────────
 if "messages" not in st.session_state or len(st.session_state.messages) == 0:

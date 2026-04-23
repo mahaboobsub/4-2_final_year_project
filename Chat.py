@@ -22,6 +22,14 @@ load_dotenv()
 # Initialize Local Storage
 local_storage = LocalStorage()
 
+def safe_delete_chat_history():
+    try:
+        local_storage.deleteItem("chat_history")
+    except KeyError:
+        logger.info("SESSION: No chat_history key found in local storage; nothing to delete.")
+    except Exception as e:
+        logger.warning(f"SESSION: Failed to delete chat_history from local storage: {e}")
+
 # ─── LOGGING SETUP ───────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -78,7 +86,7 @@ with col1:
         st.session_state.messages = []
         st.session_state.chain = None
         st.session_state.current_provider = None
-        local_storage.deleteItem("chat_history")
+        safe_delete_chat_history()
         logger.info("ACTION: New chat started, local storage cleared")
         st.rerun()
 with col2:
@@ -86,11 +94,9 @@ with col2:
         st.session_state.messages = []
         st.session_state.chain = None
         st.session_state.current_provider = None
-        local_storage.deleteItem("chat_history")
+        safe_delete_chat_history()
         logger.info("ACTION: All cleared, local storage cleared")
         st.rerun()
-
-st.sidebar.divider()
 
 # ─── SIDEBAR: PDF UPLOAD ────────────────────────────────────────────────────
 st.sidebar.header("📄 Upload PDF")
@@ -139,9 +145,9 @@ st.sidebar.divider()
 def get_llm(use_cloud_api):
     """Returns the appropriate LLM based on the selected provider."""
     if use_cloud_api and has_api_key:
-        logger.info("  LLM: Initializing Mistral Cloud API (model=mistral-small-latest)")
+        logger.info("  LLM: Initializing Mistral Cloud API (model=open-mistral-7b)")
         return ChatMistralAI(
-            model="mistral-small-latest",
+            model="open-mistral-7b",
             api_key=mistral_api_key,
             temperature=0.3
         )

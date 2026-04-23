@@ -13,13 +13,13 @@ if not api_key:
     sys.exit(1)
 
 try:
-    llm = ChatMistralAI(model='mistral-small-latest', api_key=api_key)
+    llm = ChatMistralAI(model='open-mistral-7b', api_key=api_key)
     print('Sending ping to Mistral AI via Langchain (non-streaming)...')
     response = llm.invoke([HumanMessage(content='Say Pong')])
     print(f'SUCCESS (invoke)! Response: {response.content}')
     
     print('\nTesting Streaming...')
-    llm_stream = ChatMistralAI(model='mistral-small-latest', api_key=api_key, streaming=True)
+    llm_stream = ChatMistralAI(model='open-mistral-7b', api_key=api_key, streaming=True)
     print('Sending ping to Mistral AI via Langchain (streaming)...')
     for chunk in llm_stream.stream([HumanMessage(content='Say Pong streaming')]):
         print(chunk.content, end='')
